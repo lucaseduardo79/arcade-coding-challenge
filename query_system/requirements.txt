@@ -1,0 +1,9 @@
+streamlit
+groq
+openai
+langsmith
+langchain-core
+langgraph
+duckdb
+pandas
+python-dotenv

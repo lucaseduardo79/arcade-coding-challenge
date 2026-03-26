@@ -1,0 +1,23 @@
+# Secrets
+.env
+.env.local
+
+# Shared data (generated at runtime)
+shared/db/
+shared/pdfs/
+shared/metadata/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE / Tools
+.claude*
+.vscode/
+PRESENTATION_SCRIPT.md

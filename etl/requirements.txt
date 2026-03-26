@@ -1,0 +1,11 @@
+pdfplumber
+pymupdf
+groq
+openai
+langsmith
+langchain-core
+langgraph
+pydantic>=2.0
+duckdb
+pandas
+python-dotenv

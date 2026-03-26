@@ -1,0 +1,84 @@
+services:
+  scraper:
+    build:
+      context: ./scraper
+      dockerfile: Dockerfile
+    container_name: cse-scraper
+    volumes:
+      - ./shared:/shared
+    environment:
+      - PDF_OUTPUT_DIR=/shared/pdfs
+      - MANIFEST_PATH=/shared/metadata/scrape_manifest.json
+    env_file:
+      - .env
+    networks:
+      - cse-net
+
+  etl:
+    build:
+      context: ./etl
+      dockerfile: Dockerfile
+    container_name: cse-etl
+    volumes:
+      - ./shared:/shared
+    environment:
+      - PDF_INPUT_DIR=/shared/pdfs
+      - DB_PATH=/shared/db/financial_data.duckdb
+      - MANIFEST_PATH=/shared/metadata/scrape_manifest.json
+    env_file:
+      - .env
+    depends_on:
+      scraper:
+        condition: service_completed_successfully
+    networks:
+      - cse-net
+
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    container_name: cse-dashboard
+    volumes:
+      - ./shared:/shared:ro
+    environment:
+      - DB_PATH=/shared/db/financial_data.duckdb
+    ports:
+      - "8501:8501"
+    depends_on:
+      etl:
+        condition: service_completed_successfully
+    networks:
+      - cse-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  query-system:
+    build:
+      context: ./query_system
+      dockerfile: Dockerfile
+    container_name: cse-query
+    volumes:
+      - ./shared:/shared:ro
+    environment:
+      - DB_PATH=/shared/db/financial_data.duckdb
+    env_file:
+      - .env
+    ports:
+      - "8502:8502"
+    depends_on:
+      etl:
+        condition: service_completed_successfully
+    networks:
+      - cse-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8502/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+networks:
+  cse-net:
+    driver: bridge
