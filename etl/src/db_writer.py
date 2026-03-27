@@ -274,15 +274,71 @@ def insert_extraction(
         conn.close()
 
 
-def compute_quarterly_standalone():
-    """Derive single-quarter figures from cumulative interim reports.
+def _upsert_quarterly(conn, company_id, period_end, fiscal_year, fiscal_quarter,
+                       values: dict, method: str):
+    """Insert or update a quarterly_standalone record."""
+    qid = conn.execute("SELECT nextval('seq_quarterly_id')").fetchone()[0]
+    conn.execute(
+        """
+        INSERT INTO quarterly_standalone
+        (record_id, company_id, period_end, fiscal_year, fiscal_quarter,
+         revenue, cost_of_goods_sold, gross_profit, operating_expenses,
+         operating_income, net_income, currency, unit_scale, derivation_method)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'LKR', 'thousands', ?)
+        ON CONFLICT (company_id, fiscal_year, fiscal_quarter) DO UPDATE SET
+            period_end = EXCLUDED.period_end,
+            revenue = EXCLUDED.revenue,
+            cost_of_goods_sold = EXCLUDED.cost_of_goods_sold,
+            gross_profit = EXCLUDED.gross_profit,
+            operating_expenses = EXCLUDED.operating_expenses,
+            operating_income = EXCLUDED.operating_income,
+            net_income = EXCLUDED.net_income,
+            derivation_method = EXCLUDED.derivation_method
+        """,
+        [
+            qid, company_id, period_end, fiscal_year, fiscal_quarter,
+            values["revenue"], values["cost_of_goods_sold"],
+            values["gross_profit"], values["operating_expenses"],
+            values["operating_income"], values["net_income"],
+            method,
+        ],
+    )
 
-    E.g. Q2 standalone = H1 cumulative - Q1 cumulative.
+
+def compute_quarterly_standalone():
+    """Derive single-quarter figures for the quarterly_standalone table.
+
+    Two sources:
+    1. Non-cumulative 3-month records → copied directly
+    2. Cumulative records → Q2 standalone = H1 - Q1, etc.
     """
     conn = get_connection()
     try:
-        # Get all cumulative records ordered by company and period
-        records = conn.execute(
+        columns = [
+            "revenue", "cost_of_goods_sold", "gross_profit",
+            "operating_expenses", "operating_income", "net_income",
+        ]
+
+        # ── Source 1: Direct quarterly records (is_cumulative=FALSE, period_months=3) ──
+        direct_records = conn.execute(
+            """
+            SELECT company_id, period_end, period_months, fiscal_year, fiscal_quarter,
+                   revenue, cost_of_goods_sold, gross_profit, operating_expenses,
+                   operating_income, net_income
+            FROM income_statement
+            WHERE is_cumulative = FALSE AND period_months = 3
+            ORDER BY company_id, period_end
+            """
+        ).fetchall()
+
+        for rec in direct_records:
+            values = {columns[i]: rec[5 + i] or 0.0 for i in range(len(columns))}
+            _upsert_quarterly(conn, rec[0], rec[1], rec[3], rec[4], values, "direct")
+
+        logger.info(f"Inserted {len(direct_records)} direct quarterly records")
+
+        # ── Source 2: Derived from cumulative records ──
+        cumulative_records = conn.execute(
             """
             SELECT company_id, period_end, period_months, fiscal_year, fiscal_quarter,
                    revenue, cost_of_goods_sold, gross_profit, operating_expenses,
@@ -293,19 +349,13 @@ def compute_quarterly_standalone():
             """
         ).fetchall()
 
-        columns = [
-            "revenue", "cost_of_goods_sold", "gross_profit",
-            "operating_expenses", "operating_income", "net_income",
-        ]
-
-        # Group by company and fiscal year
         by_company_fy: dict[tuple[str, str], list] = {}
-        for row in records:
+        for row in cumulative_records:
             key = (row[0], row[3])  # company_id, fiscal_year
             by_company_fy.setdefault(key, []).append(row)
 
+        derived_count = 0
         for (company_id, fiscal_year), fy_records in by_company_fy.items():
-            # Sort by period_months
             fy_records.sort(key=lambda r: r[2])
 
             prev_values = {c: 0.0 for c in columns}
@@ -319,41 +369,17 @@ def compute_quarterly_standalone():
                     columns[i]: rec[5 + i] or 0.0 for i in range(len(columns))
                 }
 
-                # Standalone = current cumulative - previous cumulative
                 standalone = {
                     c: current_values[c] - prev_values[c] for c in columns
                 }
 
                 method = "direct" if period_months == 3 else "computed_from_cumulative"
-
-                qid = conn.execute("SELECT nextval('seq_quarterly_id')").fetchone()[0]
-                conn.execute(
-                    """
-                    INSERT INTO quarterly_standalone
-                    (record_id, company_id, period_end, fiscal_year, fiscal_quarter,
-                     revenue, cost_of_goods_sold, gross_profit, operating_expenses,
-                     operating_income, net_income, currency, unit_scale, derivation_method)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'LKR', 'thousands', ?)
-                    ON CONFLICT (company_id, fiscal_year, fiscal_quarter) DO UPDATE SET
-                        period_end = EXCLUDED.period_end,
-                        revenue = EXCLUDED.revenue,
-                        cost_of_goods_sold = EXCLUDED.cost_of_goods_sold,
-                        gross_profit = EXCLUDED.gross_profit,
-                        operating_expenses = EXCLUDED.operating_expenses,
-                        operating_income = EXCLUDED.operating_income,
-                        net_income = EXCLUDED.net_income,
-                        derivation_method = EXCLUDED.derivation_method
-                    """,
-                    [
-                        qid, company_id, period_end, fiscal_year, fiscal_quarter,
-                        standalone["revenue"], standalone["cost_of_goods_sold"],
-                        standalone["gross_profit"], standalone["operating_expenses"],
-                        standalone["operating_income"], standalone["net_income"],
-                        method,
-                    ],
-                )
+                _upsert_quarterly(conn, company_id, period_end, fiscal_year,
+                                  fiscal_quarter, standalone, method)
+                derived_count += 1
                 prev_values = current_values
 
+        logger.info(f"Inserted {derived_count} cumulative-derived quarterly records")
         logger.info("Computed quarterly standalone figures")
     finally:
         conn.close()
