@@ -358,7 +358,28 @@ def compute_quarterly_standalone():
         for (company_id, fiscal_year), fy_records in by_company_fy.items():
             fy_records.sort(key=lambda r: r[2])
 
+            first_period = fy_records[0][2]  # period_months of first cumulative record
+
+            # If the first cumulative record is > 3 months (e.g. H1=6m),
+            # we need to subtract earlier direct quarters to get the standalone figure.
+            # Sum up all direct (non-cumulative) quarters that precede the first cumulative period.
             prev_values = {c: 0.0 for c in columns}
+            if first_period > 3:
+                prior_quarters = conn.execute(
+                    """
+                    SELECT revenue, cost_of_goods_sold, gross_profit,
+                           operating_expenses, operating_income, net_income
+                    FROM income_statement
+                    WHERE company_id = ? AND fiscal_year = ?
+                      AND is_cumulative = FALSE AND period_months = 3
+                    ORDER BY period_end
+                    """,
+                    [company_id, fiscal_year],
+                ).fetchall()
+                for pq in prior_quarters:
+                    for i, c in enumerate(columns):
+                        prev_values[c] += pq[i] or 0.0
+
             for rec in fy_records:
                 period_months = rec[2]
                 quarter_num = period_months // 3
