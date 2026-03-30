@@ -74,7 +74,11 @@ if user_input:
     # Get agent response
     with st.chat_message("assistant"):
         with st.spinner("Analyzing..."):
-            response = st.session_state.agent.query(user_input)
+            try:
+                response = st.session_state.agent.query(user_input)
+            except Exception as e:
+                response = "Sorry, an error occurred while processing your question. Please try again."
         st.markdown(response)
 
     st.session_state.chat_history.append({"role": "assistant", "content": response})
+    st.rerun()

@@ -1,7 +1,9 @@
 """LangGraph Text2SQL agent following raw Groq SDK pattern with guardrails and fallback."""
 
 import os
+import re
 import json
+import time
 import logging
 from uuid import uuid4
 
@@ -11,7 +13,7 @@ from langsmith import traceable
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langgraph.graph import START, END, StateGraph, MessagesState
-from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.prebuilt import ToolNode
 
 from .config import GROQ_MODEL, GROQ_TEMPERATURE, DB_PATH, MAX_QUERY_ROWS
 from .prompts import SYSTEM_PROMPT, FEW_SHOT_EXAMPLES
@@ -40,7 +42,7 @@ else:
 
 @traceable(run_type="llm", name="groq_chat")
 def groq_chat(messages, model=GROQ_MODEL, temperature=GROQ_TEMPERATURE,
-              max_completion_tokens=2000, top_p=1.0) -> str:
+              max_completion_tokens=1024, top_p=1.0) -> str:
     """Call Groq API with fallback (traced by LangSmith via @traceable)."""
     kwargs = dict(
         model=model,
@@ -51,26 +53,37 @@ def groq_chat(messages, model=GROQ_MODEL, temperature=GROQ_TEMPERATURE,
         stream=False,
     )
 
-    try:
-        completion = groq_client.chat.completions.create(**kwargs)
-        return completion.choices[0].message.content or ""
-    except Exception as e:
-        error_str = str(e)
-        if "429" in error_str or "rate_limit" in error_str or "tokens per" in error_str:
-            logger.warning(f"Groq rate limited: {error_str[:120]}. Trying fallback...")
-            if fallback_client:
-                try:
-                    fb_kwargs = {**kwargs, "model": FALLBACK_MODEL}
-                    logger.info(f"Using fallback: {FALLBACK_BASE_URL} model={FALLBACK_MODEL}")
-                    completion = fallback_client.chat.completions.create(**fb_kwargs)
-                    return completion.choices[0].message.content or ""
-                except Exception as fb_err:
-                    logger.error(f"Fallback also failed: {fb_err}")
-                    raise
-            else:
-                logger.error("No fallback configured. Set FALLBACK_API_KEY env var.")
-                raise
-        raise
+    # Try Groq first, then fallback, with a brief backoff on rate limits
+    for attempt in range(2):
+        try:
+            if attempt > 0:
+                time.sleep(2)
+            completion = groq_client.chat.completions.create(**kwargs)
+            return completion.choices[0].message.content or ""
+        except Exception as e:
+            error_str = str(e)
+            is_rate_limit = "429" in error_str or "rate_limit" in error_str or "tokens per" in error_str
+            if is_rate_limit:
+                logger.warning(f"Groq rate limited (attempt {attempt + 1}): {error_str[:120]}")
+                if attempt == 0:
+                    continue  # retry Groq once after backoff
+                # After retry, try fallback
+                if fallback_client:
+                    try:
+                        fb_kwargs = {**kwargs, "model": FALLBACK_MODEL}
+                        logger.info(f"Using fallback: {FALLBACK_BASE_URL} model={FALLBACK_MODEL}")
+                        completion = fallback_client.chat.completions.create(**fb_kwargs)
+                        return completion.choices[0].message.content or ""
+                    except Exception as fb_err:
+                        logger.error(f"Fallback also failed: {fb_err}")
+                        raise RuntimeError(
+                            "Both primary and fallback LLM APIs are rate limited. Please wait a moment and try again."
+                        ) from fb_err
+                else:
+                    raise RuntimeError(
+                        "LLM API is rate limited and no fallback is configured. Please wait a moment and try again."
+                    ) from e
+            raise
 
 
 # ── Tools ──
@@ -173,7 +186,13 @@ def _get_schema_text() -> str:
 # ── Message conversion (LangChain → Groq raw format) ──
 
 def lc_messages_to_groq(messages):
-    """Convert LangChain message objects to Groq API dict format."""
+    """Convert LangChain message objects to Groq API dict format.
+
+    ToolMessages are sent as "user" role (not "assistant") to prevent the LLM
+    from mimicking tool-result patterns in its own output.
+    AIMessages with tool_calls (the request, not the result) are represented as
+    the TOOL: JSON the LLM originally produced, so it sees a consistent pattern.
+    """
     out = []
     for m in messages:
         if isinstance(m, SystemMessage):
@@ -181,13 +200,21 @@ def lc_messages_to_groq(messages):
         elif isinstance(m, HumanMessage):
             out.append({"role": "user", "content": m.content})
         elif isinstance(m, ToolMessage):
-            tool_name = getattr(m, "name", "tool")
+            # Send as "user" so the LLM doesn't learn to produce these tags
             out.append({
-                "role": "assistant",
-                "content": f"[TOOL_RESULT name={tool_name} tool_call_id={m.tool_call_id}] {m.content}",
+                "role": "user",
+                "content": f"Database query result:\n{m.content}",
             })
         elif isinstance(m, AIMessage):
-            out.append({"role": "assistant", "content": m.content})
+            # If this AI message had tool_calls, show what the LLM originally said
+            if m.tool_calls:
+                tc = m.tool_calls[0]
+                out.append({
+                    "role": "assistant",
+                    "content": f'TOOL: {{"name": "{tc["name"]}", "args": {json.dumps(tc["args"])}}}',
+                })
+            elif m.content:
+                out.append({"role": "assistant", "content": m.content})
         else:
             out.append({"role": "assistant", "content": str(getattr(m, "content", m))})
     return out
@@ -195,15 +222,74 @@ def lc_messages_to_groq(messages):
 
 # ── LLM output parser ──
 
+def _extract_json_object(text: str):
+    """Extract the first JSON object from text by matching braces."""
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    in_string = False
+    escape_next = False
+    for i in range(start, len(text)):
+        c = text[i]
+        if escape_next:
+            escape_next = False
+            continue
+        if c == "\\":
+            escape_next = True
+            continue
+        if c == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(text[start:i + 1])
+                except json.JSONDecodeError:
+                    return None
+    return None
+
+
+def _clean_llm_text(text: str) -> str:
+    """Strip hallucinated tool-result tags and any content before the real directive."""
+    # Remove any [TOOL_RESULT ...] or [/TOOL_RESULT] tags and content before them
+    text = re.sub(r"\[/?TOOL_RESULT[^\]]*\]", "", text)
+    # If the LLM hallucinated data before a TOOL: or FINAL: directive, keep only the directive
+    for prefix in ("TOOL:", "FINAL:"):
+        idx = text.find(prefix)
+        if idx > 0:
+            text = text[idx:]
+            break
+    return text.strip()
+
+
 def parse_llm_output(text: str):
     """Parse structured LLM output: TOOL: {...} or FINAL: ..."""
     if not text:
         return "error", None
-    text = text.strip()
+
+    text = _clean_llm_text(text)
+    if not text:
+        return "error", None
+
     if text.startswith("TOOL:"):
+        # Try direct parse first, then robust JSON extraction
+        remainder = text[len("TOOL:"):].strip()
+        # Strip any trailing FINAL: and everything after it (LLM combining both)
+        final_idx = remainder.find("FINAL:")
+        if final_idx > 0:
+            remainder = remainder[:final_idx].strip()
         try:
-            return "tool", json.loads(text[len("TOOL:"):].strip())
+            return "tool", json.loads(remainder)
         except json.JSONDecodeError:
+            obj = _extract_json_object(remainder)
+            if obj:
+                return "tool", obj
             return "error", None
     if text.startswith("FINAL:"):
         return "final", text[len("FINAL:"):].strip()
@@ -261,8 +347,12 @@ def assistant(state: MessagesState):
     if kind == "final":
         return {"messages": [AIMessage(content=payload)]}
 
-    # Fallback
-    return {"messages": [AIMessage(content=llm_text)]}
+    # Fallback: strip any protocol prefixes before showing to user
+    clean = llm_text.strip()
+    for prefix in ("TOOL:", "FINAL:"):
+        if clean.startswith(prefix):
+            clean = clean[len(prefix):].strip()
+    return {"messages": [AIMessage(content=clean or "I couldn't process that. Please try again.")]}
 
 
 def guardrails_router(state: MessagesState) -> str:
@@ -271,6 +361,14 @@ def guardrails_router(state: MessagesState) -> str:
     if isinstance(last_msg, AIMessage):
         return "end"
     return "assistant"
+
+
+def assistant_router(state: MessagesState) -> str:
+    """Route after assistant: tools if tool_calls, else end."""
+    last_msg = state["messages"][-1] if state["messages"] else None
+    if isinstance(last_msg, AIMessage) and last_msg.tool_calls:
+        return "tools"
+    return "__end__"
 
 
 # ── Build graph ──
@@ -287,7 +385,11 @@ builder.add_conditional_edges(
     guardrails_router,
     {"assistant": "assistant", "end": END},
 )
-builder.add_conditional_edges("assistant", tools_condition)
+builder.add_conditional_edges(
+    "assistant",
+    assistant_router,
+    {"tools": "tools", "__end__": END},
+)
 builder.add_edge("tools", "assistant")
 
 graph = builder.compile()
